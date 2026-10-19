@@ -74,11 +74,13 @@ Kamuoyuna saygıyla duyurulur.
         self.assertEqual(rows[0]['relevance'],'dogrudan')
         self.assertFalse(parse_text(text.replace('VRF Klima montajı','Boya işi'),{'name':'EKAP'},classify,'BULTEN_12102026_YAPIM.pdf','12.10.2026')[0])
 
-    def test_private_projects_only_ongoing_and_ced_not_mining(self):
+    def test_private_projects_keep_delivery_status_and_ced_not_mining(self):
         source={'key':'projects','name':'Projeler','url':'https://example.com'}
         html='<div class="single-p durum-devam-eden"><h5 class="sing-title">Proje A</h5></div><div class="single-p durum-hemen-teslim"><h5 class="sing-title">Proje B</h5></div>'
         rows,count=emlak_projects(html,source)
-        self.assertEqual((len(rows),count),(1,2))
+        self.assertEqual((len(rows),count),(2,2))
+        self.assertEqual(enrich(rows[0],NOW)['opportunity']['status'],'proje')
+        self.assertEqual(enrich(rows[1],NOW)['opportunity']['status'],'arsiv')
         self.assertIsNone(csb_detail('<div class="haber-detay-desc-wrapper">Kalker ocağı kapasite artışı projesi</div>',source,'https://example.com/detail'))
         lead=csb_detail('<div class="haber-detay-desc-wrapper">İstanbul adresinde, Örnek Ltd. Şti. tarafından yapılması planlanan “Yeni Otel Projesi”</div>',source,'https://example.com/detail')
         self.assertEqual(lead['project_owner'],'Örnek Ltd. Şti.')

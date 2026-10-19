@@ -12,7 +12,7 @@
     {"key": "istinye", "name": "İstinye Üniversitesi", "url": "https://www.istinye.edu.tr/tr/ihaleler", "adapter": "istinye", "stage": "ilan", "max_pages": 2},
     {"key": "ipkb", "name": "İstanbul Proje Koordinasyon Birimi", "url": "https://www.ipkb.gov.tr/ihale/", "adapter": "ipkb", "stage": "ilan", "max_pages": 3},
     {"key": "tki", "name": "Türkiye Kömür İşletmeleri", "url": "https://www.tki.gov.tr/ihaleler", "adapter": "tki", "stage": "ilan"},
-    {"key": "ekap", "name": "EKAP - İlanlar ve Yüklenici Sonuçları", "url": "https://ekap.kik.gov.tr/EKAP/Ilan/BultenIndirme.aspx", "adapter": "ekap_bulletin", "enabled": true, "bulletin_days": 1, "archive_days": 90, "backfill_batch_days": 30},
+    {"key": "ekap", "name": "EKAP - İlanlar ve Yüklenici Sonuçları", "url": "https://ekap.kik.gov.tr/EKAP/Ilan/BultenIndirme.aspx", "adapter": "ekap_bulletin", "enabled": true, "bulletin_days": 1, "recheck_days": 3, "archive_days": 90, "backfill_batch_days": 30},
     {"key": "emlak_projects", "name": "Emlak Konut - Devam Eden Projeler", "url": "https://sales.emlakkonut.com.tr/?locale=tr", "adapter": "emlak_projects"},
     {"key": "csb_istanbul", "name": "İstanbul - Resmî ÇED/Yatırım Duyuruları", "url": "https://istanbul.csb.gov.tr/duyurular", "adapter": "csb_projects", "city": "İstanbul", "max_pages": 2, "max_details": 20},
     {"key": "csb_ankara", "name": "Ankara - Resmî ÇED/Yatırım Duyuruları", "url": "https://ankara.csb.gov.tr/duyurular", "adapter": "csb_projects", "city": "Ankara", "max_pages": 2, "max_details": 20},

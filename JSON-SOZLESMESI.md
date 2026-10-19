@@ -54,6 +54,9 @@ kullanarak seçim yapılmalıdır. HVAC eşleşmesi başlığa dayanır; teknik
 | contact_search_url | Kurumsal iletişim araştırması için arama bağlantısı; bulunan telefon değildir |
 | match_basis / match_evidence | Başlık, iş kapsamı veya proje kaynağına dayanan eşleşme ve kanıt metni |
 | project_owner | ÇED metninde çıkarılabilen yatırımcı; yoksa null |
+| related_announcements | Aynı kurum ve numarayla birleştirilen kaynak ilan/düzeltme/iptal metinleri; compact çıktıda çıkarılır |
+| source_presence | Emlak Konut listesinde present veya missing; kaybolma tamamlanma kanıtı değildir |
+| missing_since_at / last_known_source_status | Listeden kaybolduğunda ilk saptama zamanı ve önceki kaynak durumu |
 
 contacts.role idare, yuklenici veya duyuru olabilir. İdare telefonu yüklenicinin
 telefonu olarak kullanılmamalıdır. Bir yüklenici kaydı bir iş ortaklığının tamamını
@@ -74,3 +77,8 @@ ile sonuç bültenleri okunur.
 Arşiv hedefi varsayılan 90 gündür, kademeli doldurulur. Tamamlanan/kalan günler
 api/status içindeki EKAP archive nesnesinde bulunur. Bütün hedef tarihler tamamlanmadan
 çıktı 90 günlük eksiksiz arşiv olarak sunulmamalıdır. Sonuç bültenleri de okunur.
+
+archive.provisional_days bugünün geçici kontrolüdür. completed_days yalnız geçmiş
+günleri sayar; remaining_days tamamlanan ve bugün geçici kontrol edilen günler
+dışındaki arşiv işidir. remaining_days=0 bugünün yayınının kesinleştiği anlamına
+gelmez. Son günler recheck_days penceresiyle yeniden kontrol edilir.

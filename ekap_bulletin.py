@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlencode
 from zipfile import ZipFile
-from source_adapters import Tree, normalize, parse_date, TR
+from source_adapters import Tree, normalize, parse_date, TR, MONTHS
 
 URL = 'https://ekap.kik.gov.tr/EKAP/Ilan/BultenIndirme.aspx'
 ROOT = Path(__file__).resolve().parent
@@ -36,7 +36,8 @@ def curl(args):
 def download(kind, date):
     STORE.mkdir(parents=True, exist_ok=True)
     cache = STORE / f'{date:%Y%m%d}_{kind}.json'
-    if cache.exists() and (date < datetime.now(TR).date() or datetime.now().timestamp() - cache.stat().st_mtime < 4*3600):
+    # Yakın geçmişteki boş/eksik bir indirme kalıcı önbellek olmasın.
+    if cache.exists() and (date < datetime.now(TR).date() - timedelta(days=7) or datetime.now(TR).timestamp() - cache.stat().st_mtime < 4*3600):
         files = [STORE / name for name in json.loads(cache.read_text())]
         if all(p.exists() for p in files):
             return files
@@ -96,14 +97,39 @@ def extract_field(text, pattern):
     return ' '.join(match[1].split()) if match else ''
 
 
+def correction_date(text):
+    """Yeni ihale tarihini etiketli alandan al; eski tarih/yayın/teslim tarihini kullanma."""
+    normalized = normalize(text)
+    section = re.split(r'duzeltilen\s+hususlar\s*:?|duzeltilecek\s+hususlar\s*:?', normalized)[-1]
+    label = r'(?:ihale(?:nin)?\s+(?:tarih(?:i)?\s*(?:ve\s*saat(?:i)?)?|yapilacagi\s+tarih)|2\.1\.\s*tarih\s+ve\s+saati)\s*[:=]?\s*'
+    date_pattern = r'\b(?:\d{1,2}[./]\d{1,2}[./]20\d{2}|\d{1,2}\s+(?:' + '|'.join(MONTHS) + r')\s+20\d{2})(?:\s*[-,]?\s*\d{1,2}[:.]\d{2})?'
+    found = []
+    for match in re.finditer(label, section):
+        value = section[match.end():match.end()+220]
+        value = re.split(r'\b(?:teslim\s+tarihi|ilan\s+tarihi|dokuman\s+teslim)',value,maxsplit=1)[0]
+        # "Eski tarih ... yerine yeni tarih ..." değişiklik metninde yeni değeri seç.
+        if 'yerine' in value:
+            value = value.split('yerine',1)[1]
+        date = re.match(r'[^\d]{0,35}(' + date_pattern + ')', value)
+        if date and parse_date(date[1])[0]:
+            found.append(date[1])
+    return found[-1] if found else ''
+
+
 def merge_record(old, incoming):
     """Geçmiş ilan güncel sonucu ezmez; kaynaklar ve çoklu yükleniciler korunur."""
     def order(row):
         date = parse_date(row.get('published_date_raw'))[0] or ''
         stage = {'ilan':0,'duzeltme':1,'sonuc':2,'iptal':3}.get(row.get('stage'),0)
         return date,stage
-    primary, other = (incoming,old) if order(incoming)>=order(old) else (old,incoming)
+    old_order, incoming_order = order(old), order(incoming)
+    if not old_order[0] or not incoming_order[0]:
+        # Tarihi okunamayan eski ilan bir iptal veya sonucu yeniden açmasın.
+        old_order, incoming_order = old_order[::-1], incoming_order[::-1]
+    primary, other = (incoming,old) if incoming_order>=old_order else (old,incoming)
     merged = dict(primary)
+    if old.get('id'):
+        merged['id'] = old['id']
     for key in ('authority','tender_date_raw','tender_date_iso','date_precision'):
         if not merged.get(key) and other.get(key):
             merged[key]=other[key]
@@ -121,11 +147,23 @@ def merge_record(old, incoming):
             contacts[json.dumps(c,sort_keys=True)]=c
     merged['contractors']=[contractors[k] for k in sorted(contractors)]
     merged['contacts']=[contacts[k] for k in sorted(contacts)]
-    if other.get('relevance')=='dogrudan' and merged.get('relevance')!='dogrudan':
-        merged['relevance']='dogrudan'
+    if {'dogrudan':2,'potansiyel':1}.get(other.get('relevance'),0) > {'dogrudan':2,'potansiyel':1}.get(merged.get('relevance'),0):
+        merged['relevance']=other['relevance']
         merged['matched_keywords']=other.get('matched_keywords',[])
         merged['match_basis']=other.get('match_basis','title')
         merged['match_evidence']=other.get('match_evidence')
+    if merged.get('source_key') != 'ekap':
+        events = {}
+        fields = ('title','url','stage','published_date_raw','tender_date_raw','announcement_text','document_links')
+        for row in (other,primary):
+            for event in row.get('related_announcements', []):
+                events[(event.get('url'),event.get('stage'))] = event
+            if not row.get('related_announcements'):
+                event = {k:row[k] for k in fields if k in row}
+                events[(row.get('url'),row.get('stage'))] = event
+        merged['related_announcements'] = [events[k] for k in sorted(events, key=lambda k: (k[0] or '',k[1] or ''))]
+    if merged.get('relevance'):
+        merged.pop('lifecycle_only',None)
     return merged
 
 
@@ -158,14 +196,17 @@ def parse_text(text, source, classify, filename, published):
         # Uygulama kapsamındaki HVAC ifadesi hariç salt yıkım/çatı/araç/gıda işi satış adayı değildir.
         excluded=any(term in normalize(title) for term in ('yikim','cati','cephe boy','basketbol pota','basketbol saha','bisiklet yolu','akaryakit','sut sogutma','klimali arac','klimali otobus'))
         if excluded and scope_kind!='dogrudan':
-            continue
-        if not relevance and stage!='ilan' and 'YAPIM' in filename:
+            if stage not in ('iptal','duzeltme'):
+                continue
+            relevance,matches=None,[]
+        if not relevance and not excluded and stage!='ilan' and 'YAPIM' in filename:
             relevance, matches = classify(title+' yapım')
-        if not relevance:
+        lifecycle_only = not relevance and stage in ('iptal','duzeltme')
+        if not relevance and not lifecycle_only:
             continue
         authority = extract_field(block,r'1\.1\.\s*Ad[ıi]\s*:\s*(.*?)\s*1\.2\.')
         authority = authority or extract_field(block,r'1\s*[-.)]?\s*a\)\s*(?:Ad[ıi]|İdarenin adı)\s*:\s*(.*?)\s*b\)')
-        raw_date = extract_field(block,r'2\.1\.\s*Tarih\s*ve\s*Saati\s*:\s*([\d./]+\s*[-,]?\s*\d{1,2}[:.]\d{2})') if stage=='ilan' else ''
+        raw_date = extract_field(block,r'2\.1\.\s*Tarih\s*ve\s*Saati\s*:\s*([\d./]+\s*[-,]?\s*\d{1,2}[:.]\d{2})') if stage=='ilan' else correction_date(block) if stage=='duzeltme' else ''
         if stage=='sonuc':
             raw_date=extract_field(block,r'1\s*[-–]\s*İhalenin\s*a\)\s*Tarihi\s*:\s*([\d./]+)')
             lines=[line.strip() for line in before_number.splitlines() if line.strip()]
@@ -199,6 +240,8 @@ def parse_text(text, source, classify, filename, published):
             contractors=contractors,contacts=contacts,procurement_type='Yapım' if 'YAPIM' in filename else 'Hizmet' if 'HIZMET' in filename else 'Mal',
             announcement_text=block[:60000],source_excerpt=block[:1500],
             acquisition_method='official_bulletin',bulletin_reference={'filename':filename,'published_date':published,'page_start':page_start}))
+        if lifecycle_only:
+            items[-1]['lifecycle_only'] = True
     return items,len(starts)
 
 
@@ -206,9 +249,10 @@ def progress_summary(source):
     path=STORE/'archive-progress.json'
     data=json.loads(path.read_text(encoding='utf-8')) if path.exists() else {}
     today=datetime.now(TR).date()
-    target=min(365,max(1,source.get('archive_days',90)))
-    done=sum((today-timedelta(days=i)).isoformat() in data.get('completed_dates',[]) for i in range(target))
-    return {'target_days':target,'completed_days':done,'remaining_days':target-done}
+    target=min(365,max(min(7,max(1,source.get('bulletin_days',1))),source.get('archive_days',90)))
+    done=sum((today-timedelta(days=i)).isoformat() in data.get('completed_dates',[]) for i in range(1,target))
+    provisional = int(today.isoformat() in data.get('provisional_dates',[]))
+    return {'target_days':target,'completed_days':done,'provisional_days':provisional,'remaining_days':target-done-provisional}
 
 
 def collect(source, classify, on_batch=None):
@@ -217,16 +261,21 @@ def collect(source, classify, on_batch=None):
     except ImportError as exc:
         raise RuntimeError('EKAP bülteni için python -m pip install -r requirements.txt çalıştırın') from exc
     items, count, pages, warnings = {},0,0,[]
+    STORE.mkdir(parents=True,exist_ok=True)
     progress_path=STORE/'archive-progress.json'
     progress=json.loads(progress_path.read_text(encoding='utf-8')) if progress_path.exists() else {'completed_dates':[]}
     today=datetime.now(TR).date()
     daily=min(7,max(1,source.get('bulletin_days',1)))
     target=min(365,max(daily,source.get('archive_days',90)))
+    daily=max(daily,min(target,7,max(1,source.get('recheck_days',3))))
+    # Bugünün yayını gün içinde değişebilir; kalıcı tamamlanmış gün değildir.
+    progress['completed_dates']=[d for d in progress['completed_dates'] if d<today.isoformat()]
+    progress['provisional_dates']=[d for d in progress.get('provisional_dates',[]) if d==today.isoformat()]
     offsets=list(range(daily))
     pending=[i for i in range(daily,target) if (today-timedelta(days=i)).isoformat() not in progress['completed_dates']]
     offsets+=pending[:max(1,min(30,source.get('backfill_batch_days',5)))]
     for offset in offsets:
-        date = datetime.now(TR).date()-timedelta(days=offset)
+        date = today-timedelta(days=offset)
         date_items={}
         date_ok=True
         print(f'EKAP bülten/sonuç: {date}',flush=True)
@@ -259,9 +308,12 @@ def collect(source, classify, on_batch=None):
         if on_batch and date_items:
             on_batch(list(date_items.values()))
         if date_ok:
-            progress['completed_dates']=sorted(set(progress['completed_dates']+[date.isoformat()]))
+            if date == today:
+                progress['provisional_dates']=[date.isoformat()]
+            else:
+                progress['completed_dates']=sorted(set(progress['completed_dates']+[date.isoformat()]))
             progress_path.write_text(json.dumps(progress,ensure_ascii=False),encoding='utf-8')
-        print(f'EKAP {date}: {len(date_items)} satış adayı',flush=True)
+        print(f'EKAP {date}: {sum(not row.get("lifecycle_only",False) for row in date_items.values())} satış adayı',flush=True)
     if not pages and warnings:
         raise RuntimeError('; '.join(warnings))
     return list(items.values()),count,pages,warnings

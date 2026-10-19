@@ -32,7 +32,15 @@ def enrich(item, current=None):
         target=item.get('project_owner') or target
         target_role='Yatırımcı / proje satınalma veya mekanik yüklenici'
         next_action='Projenin ilerleme durumunu ve HVAC satınalmasını doğrula; yatırımcı veya mekanik yükleniciye ulaş.'
-        if item.get('source_status') == 'Devam eden proje':
+        if item.get('source_presence') == 'missing':
+            status,priority='kontrol',20
+            reason='Proje son başarılı kaynak listesinde bulunamadı; güncel aşaması doğrulanmalı.'
+            next_action='Resmî kaynaktan proje durumunu yeniden doğrula; tamamlandığı veya satınalmanın açık olduğu varsayılmamalı.'
+        elif item.get('source_status') == 'Hemen teslim proje':
+            status,priority='arsiv',0
+            reason='Kaynak proje için hemen teslim bilgisi yayımlıyor; yeni HVAC ihtiyacı ayrıca doğrulanmalı.'
+            next_action='Teslime hazır proje; yeni satınalma veya bakım ihtiyacına ilişkin kanıt bekle.'
+        elif item.get('source_status') == 'Devam eden proje':
             status,priority='proje',65
     elif stage == 'sonuc':
         kind='yuklenici'

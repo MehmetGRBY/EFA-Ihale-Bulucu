@@ -25,13 +25,16 @@ def emlak_projects(html,source):
     if not cards:
         raise ValueError('Emlak Konut proje kartları bulunamadı; sayfa yapısı değişmiş olabilir')
     for card in cards:
-        if 'durum-devam-eden' not in card.attrs.get('class','').split():
-            continue
+        classes = card.attrs.get('class','').split()
+        status = 'Devam eden proje' if 'durum-devam-eden' in classes else 'Hemen teslim proje' if 'durum-hemen-teslim' in classes else 'Proje durumu belirsiz'
         title=first(card,cls='sing-title')
         location=first(card,cls='sing-loc')
-        if title:
-            rows.append(item(source,title.text,source['url'],card.text,'Devam eden proje',
-                owner='Emlak Konut GYO — proje geliştirici listesi',city=location.text if location else None))
+        if not title or not title.text:
+            raise ValueError('Emlak Konut kartında proje adı okunamadı; liste eksiksiz doğrulanamadı')
+        record = item(source,title.text,source['url'],card.text,status,
+            owner='Emlak Konut GYO — proje geliştirici listesi',city=location.text if location else None)
+        record['source_presence'] = 'present'
+        rows.append(record)
     return rows,len(cards)
 
 

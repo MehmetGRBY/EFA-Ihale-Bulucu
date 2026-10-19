@@ -8,7 +8,7 @@ import threading
 import time
 import unicodedata
 import urllib.request
-from contextlib import contextmanager
+from contextlib import contextmanager, closing
 from datetime import datetime, timezone, timedelta
 from html.parser import HTMLParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -112,31 +112,103 @@ def connect():
     conn.execute("CREATE TABLE IF NOT EXISTS detail_cache_v2 (url TEXT PRIMARY KEY, fetched_at TEXT NOT NULL, payload TEXT NOT NULL)")
     try:
         with conn:
+            migrate_tender_identity(conn)
             yield conn
     finally:
         conn.close()
 
 
-def save_items(conn, items):
+def identified_item(item):
+    item = dict(item)
+    key = item.get('source_key')
+    if key == 'ekap' and item.get('stage') == 'duzeltme' and item.get('announcement_text'):
+        from ekap_bulletin import correction_date
+        corrected = correction_date(item['announcement_text'])
+        if corrected:
+            item['tender_date_raw'] = corrected
+            item['tender_date_iso'], item['date_precision'] = adapters.parse_date(corrected)
+    number = item.get('tender_number') or adapters.extract_tender_number(
+        item.get('announcement_text', ''), item.get('title', ''))
+    if key and item.get('stage') != 'proje' and re.fullmatch(r'20\d{2}/\d+', number or ''):
+        item['tender_number'] = number
+        return item, key, number
+    return item, None, None
+
+
+def migrate_tender_identity(conn):
+    """Eski URL kayıtlarını kurum + numara ile eşleştir; önce yerel yedek al."""
+    columns = {row[1] for row in conn.execute('PRAGMA table_info(tenders)')}
+    if 'source_key' in columns:
+        return
+    rows = conn.execute('SELECT payload FROM tenders ORDER BY first_seen,id').fetchall()
+    backup = DB.with_name(DB.stem + '-before-lifecycle.sqlite3')
+    if rows and not backup.exists():
+        with closing(sqlite3.connect(backup)) as target:
+            conn.backup(target)
+    if not conn.in_transaction:
+        conn.execute('BEGIN')
+    conn.execute('ALTER TABLE tenders ADD COLUMN source_key TEXT')
+    conn.execute('ALTER TABLE tenders ADD COLUMN tender_number TEXT')
+    prepared = []
+    for (payload,) in rows:
+        item, key, number = identified_item(json.loads(payload))
+        prepared.append(item)
+        conn.execute('UPDATE tenders SET source_key=?,tender_number=? WHERE id=?', (key,number,item['id']))
+    # Aynı numaranın eski ilan/iptal satırları da ilk açılışta birleşir.
+    for item in prepared:
+        save_items(conn, [item], seen=False)
+    conn.execute('CREATE UNIQUE INDEX tender_identity ON tenders(source_key,tender_number) WHERE source_key IS NOT NULL AND tender_number IS NOT NULL')
+
+
+def save_items(conn, items, seen=True):
     added = changed = 0
     stamp = now()
     for item in items:
-        old = conn.execute("SELECT payload FROM tenders WHERE id=?", (item["id"],)).fetchone()
-        if old and item.get('source_key') == 'ekap':
+        item, key, number = identified_item(item)
+        if key:
             from ekap_bulletin import merge_record
-            item = merge_record(json.loads(old[0]), item)
+            item = merge_record(item, item)
+        previous = conn.execute('SELECT id,payload,first_seen,last_seen,revision FROM tenders WHERE id=? OR (source_key=? AND tender_number=?) ORDER BY first_seen,id', (item['id'],key,number)).fetchall()
+        old = previous[0] if previous else None
+        if old and (key or item.get('source_key') == 'ekap'):
+            from ekap_bulletin import merge_record
+            merged = identified_item(json.loads(old[1]))[0]
+            for duplicate in previous[1:]:
+                merged = merge_record(merged, identified_item(json.loads(duplicate[1]))[0])
+            item = merge_record(merged, item)
+            item['id'] = old[0]
         from company_contacts import enrich as enrich_contacts
         item = enrich_contacts(item)
         encoded = json.dumps(item, ensure_ascii=False, sort_keys=True)
         if old is None:
-            conn.execute("INSERT INTO tenders VALUES (?,?,?,?,?,1)", (item["id"], encoded, stamp, stamp, stamp))
-            added += 1
-        elif old[0] != encoded:
-            conn.execute("UPDATE tenders SET payload=?,last_seen=?,updated_at=?,revision=revision+1 WHERE id=?", (encoded, stamp, stamp, item["id"]))
-            changed += 1
-        else:
+            conn.execute('INSERT INTO tenders(id,payload,first_seen,last_seen,updated_at,revision,source_key,tender_number) VALUES (?,?,?,?,?,1,?,?)', (item['id'],encoded,stamp,stamp,stamp,key,number))
+            added += not item.get('lifecycle_only',False)
+        elif old[1] != encoded or len(previous) > 1:
+            for duplicate in previous[1:]:
+                conn.execute('DELETE FROM tenders WHERE id=?', (duplicate[0],))
+            last_seen = stamp if seen else max(row[3] for row in previous)
+            revision = max(row[4] for row in previous) + 1
+            conn.execute('UPDATE tenders SET payload=?,last_seen=?,updated_at=?,revision=?,source_key=?,tender_number=? WHERE id=?', (encoded,last_seen,stamp,revision,key,number,item['id']))
+            changed += not item.get('lifecycle_only',False)
+        elif seen:
             conn.execute("UPDATE tenders SET last_seen=? WHERE id=?", (stamp, item["id"]))
     return added, changed
+
+
+def reconcile_projects(conn, source, items):
+    """Tam ve başarılı Emlak Konut listesinde artık bulunmayanları doğrulamaya ayır."""
+    visible = {item['id'] for item in items}
+    changed = 0
+    for ident, payload in conn.execute('SELECT id,payload FROM tenders').fetchall():
+        item = json.loads(payload)
+        if item.get('source_key') != source['key'] or ident in visible or item.get('source_presence') == 'missing':
+            continue
+        item.update(source_presence='missing', last_known_source_status=item.get('source_status'),
+                    source_status='Kaynak listesinde bulunamadı', missing_since_at=now())
+        conn.execute('UPDATE tenders SET payload=?,updated_at=?,revision=revision+1 WHERE id=?',
+                     (json.dumps(item,ensure_ascii=False,sort_keys=True),now(),ident))
+        changed += 1
+    return changed
 
 
 def records(since=None):
@@ -150,6 +222,8 @@ def records(since=None):
         if cutoff and datetime.fromisoformat(updated) <= cutoff:
             continue
         item = dict(json.loads(payload), first_seen_at=first, last_seen_at=last, updated_at=updated, revision=revision)
+        if item.get('lifecycle_only'):
+            continue
         # Eski sürümden kalan kayıtlarda da tarih filtresi çalışır.
         item['tender_date_iso'], item['date_precision'] = adapters.parse_date(item.get('tender_date_raw', ''))
         item['freshness'] = adapters.freshness(item)
@@ -257,11 +331,13 @@ def scan(only_sources=None):
                 items, count, pages, warnings = collect_source(source,on_batch=persist_batch) if source.get('adapter')=='ekap_bulletin' else collect_source(source)
                 with connect() as conn:
                     added, changed = save_items(conn, items)
+                    if source.get('adapter') == 'emlak_projects' and not warnings:
+                        changed += reconcile_projects(conn, source, items)
                 added+=batch_totals[0]
                 changed+=batch_totals[1]
                 result["new"] += added
                 result["changed"] += changed
-                status.update(status="partial" if warnings else "ok", found=len(items), examined=count, pages=pages, new=added, changed=changed, warnings=warnings)
+                status.update(status="partial" if warnings else "ok", found=sum(not item.get('lifecycle_only',False) for item in items), examined=count, pages=pages, new=added, changed=changed, warnings=warnings)
                 if source.get('adapter')=='ekap_bulletin':
                     from ekap_bulletin import progress_summary
                     status['archive']=progress_summary(source)
@@ -328,7 +404,7 @@ class Handler(BaseHTTPRequestHandler):
                 since = parse_qs(path.query).get("since", [None])[0]
                 data=records(since)
                 if path.path=='/api/tenders' and parse_qs(path.query).get('compact')==['1']:
-                    data=[{k:v for k,v in row.items() if k not in ('announcement_text','source_excerpt','bulletin_references')} for row in data]
+                    data=[{k:v for k,v in row.items() if k not in ('announcement_text','source_excerpt','bulletin_references','related_announcements')} for row in data]
                 self.send({"schema_version": "1.3", "exported_at": now(), "items": data})
             except ValueError as exc:
                 self.send({"error": str(exc)}, 400)

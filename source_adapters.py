@@ -86,16 +86,33 @@ def first(node, tag=None, cls=None):
     return next(node.walk(tag, cls), None)
 
 
+def extract_tender_number(text='', title=''):
+    """Etiketli numarayı veya başlıktaki tek numarayı bul; kurum kapsamı ayrıca korunur."""
+    normalized = normalize(text or '')
+    match = re.search(r'(?:ihale kayit (?:numarasi|no)\s*(?:\(ikn\))?\s*[:.]?\s*|\bikn\s*:\s*)(20\d{2}\s*/\s*\d+)\b', normalized)
+    if not match:
+        match = re.search(r'\b(20\d{2}\s*/\s*\d+)\s*[’\']?\s*ikn\b', normalized)
+    if match:
+        return re.sub(r'\s+', '', match[1])
+    numbers = set(re.findall(r'\b20\d{2}/\d+\b', title or ''))
+    return next(iter(numbers)) if len(numbers) == 1 else ''
+
+
 def make_item(source, title, href, classify, tender_date='', published='', stage=None, **extra):
     kind, matches = classify(title)
-    if not kind:
-        return None
     url = urljoin(source['url'], href or '')
     if urlsplit(url).scheme not in ('http', 'https'):
         return None
     title_norm = normalize(title)
     if not stage:
         stage = 'iptal' if 'iptal' in title_norm else 'duzeltme' if any(w in title_norm for w in ['duzeltme', 'zeyilname']) else source.get('stage', 'ilan')
+    if not extra.get('tender_number'):
+        extra['tender_number'] = extract_tender_number(title=title)
+    if not kind:
+        if stage not in ('iptal','duzeltme') or not extra['tender_number']:
+            return None
+        # Genel başlıklı değişiklik ilgili eski kaydı kapatabilsin; tek başına fırsat değildir.
+        extra['lifecycle_only'] = True
     ident = hashlib.sha256((source['key'] + '|' + url).encode()).hexdigest()[:24]
     return dict(id=ident, title=title, url=url, source=source['name'], source_url=source['url'],
                 source_key=source['key'], stage=stage, tender_date_raw=tender_date,
@@ -229,14 +246,14 @@ def detail_info(html):
     # İlan gövdesi varsa menü ve genel kurum iletişimini çıktıya karıştırma.
     body = first(tree, cls='body') or first(tree, 'article') or first(tree, 'main')
     date = first(tree, 'span', 'date')
-    number = re.search(r'ihale kayit (?:numarasi|no)\s*:\s*(20\d{2}/\d+)', normalize((body or tree).text))
+    number = extract_tender_number((body or tree).text)
     documents = []
     for link in (body or tree).walk('a'):
         href = link.attrs.get('href', '')
         if re.search(r'\.(?:pdf|docx?|xlsx?|zip)(?:[?#]|$)', href, re.I):
             documents.append({'url': href, 'label': link.text})
     return {'tender_date_raw': detail_date(html), 'published_date_raw': date.text if date else '',
-            'tender_number': number[1] if number else '',
+            'tender_number': number,
             'announcement_text': body.text[:60000] if body else '',
             'document_links': documents}
 
